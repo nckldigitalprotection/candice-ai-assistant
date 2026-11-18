@@ -33,7 +33,8 @@ textarea{flex:1;min-width:0;resize:vertical;min-height:48px;max-height:120px;bac
 button{background:#08708e;border:1px solid #38d9f5;border-radius:10px;color:white;padding:12px 15px;font-weight:bold;cursor:pointer}
 button:disabled{opacity:.4;cursor:not-allowed}
 .secondary{background:#10263b;border-color:#31536a}
-.controls{display:flex;justify-content:space-between;align-items:center;padding:0 14px 14px;color:#91aabd;font-size:11px}
+.controls{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:0 14px 14px;color:#91aabd;font-size:11px;flex-wrap:wrap}
+.controlbuttons{display:flex;gap:7px;flex-wrap:wrap}
 .login{position:fixed;inset:0;background:#020914ee;display:grid;place-items:center;padding:20px;z-index:10}
 .loginbox{width:min(420px,100%);background:#0b1c30;border:1px solid #38d9f5;border-radius:16px;padding:24px}
 .loginbox h2{margin-top:0}
@@ -76,7 +77,10 @@ input{width:100%;padding:13px;background:#061321;border:1px solid #31536a;border
  </div>
  <div class="controls">
   <span id="hint">Connect to enable chat.</span>
-  <button class="secondary" id="disconnect" disabled>Disconnect</button>
+  <div class="controlbuttons">
+   <button class="secondary" id="replay" disabled>▶ Replay voice</button>
+   <button class="secondary" id="disconnect" disabled>Disconnect</button>
+  </div>
  </div>
 </section>
 </div>
@@ -108,85 +112,12 @@ input{width:100%;padding:13px;background:#061321;border:1px solid #31536a;border
  const dot = document.getElementById("dot");
  const hint = document.getElementById("hint");
  const disconnect = document.getElementById("disconnect");
+ const replay = document.getElementById("replay");
 
  let privateCode = "";
  let busy = false;
- let candiceVoice = null;
-
- // CANDICE VOICE PERSONALITY
- const VOICE_SETTINGS = {
-  rate: 0.90,
-  pitch: 1.20,
-  volume: 1.0
- };
-
- function chooseCandiceVoice() {
-  if (!("speechSynthesis" in window)) return;
-
-  const voices = speechSynthesis.getVoices();
-  if (!voices.length) return;
-
-  const englishVoices = voices.filter(v =>
-   /^en(-|$)/i.test(v.lang)
-  );
-
-  if (!englishVoices.length) return;
-
-  // Prefer natural-sounding feminine voices.
-  const preferredNames = [
-   "aria",
-   "jenny",
-   "samantha",
-   "sara",
-   "zira",
-   "female",
-   "natural",
-   "neural",
-   "google us english",
-   "google uk english"
-  ];
-
-  const scored = englishVoices.map(voice => {
-   const name = voice.name.toLowerCase();
-   let score = 0;
-
-   preferredNames.forEach((term, index) => {
-    if (name.includes(term)) score += 100 - index * 3;
-   });
-
-   if (/female|woman/i.test(name)) score += 30;
-   if (/child|girl/i.test(name)) score += 40;
-   if (/en-us/i.test(voice.lang)) score += 15;
-   if (voice.localService) score += 2;
-
-   return {voice, score};
-  });
-
-  scored.sort((a,b) => b.score - a.score);
-  candiceVoice = scored[0].voice;
- }
-
- if ("speechSynthesis" in window) {
-  chooseCandiceVoice();
-  speechSynthesis.onvoiceschanged = chooseCandiceVoice;
- }
-
- function speakAsCandice(text) {
-  if (!("speechSynthesis" in window)) return;
-
-  speechSynthesis.cancel();
-
-  const utterance = new SpeechSynthesisUtterance(text);
-
-  if (!candiceVoice) chooseCandiceVoice();
-  if (candiceVoice) utterance.voice = candiceVoice;
-
-  utterance.rate = VOICE_SETTINGS.rate;
-  utterance.pitch = VOICE_SETTINGS.pitch;
-  utterance.volume = VOICE_SETTINGS.volume;
-
-  speechSynthesis.speak(utterance);
- }
+ let lastAudioUrl = "";
+ let currentAudio = null;
 
  function addMessage(who, text, type) {
   const box = document.createElement("div");
@@ -261,6 +192,92 @@ input{width:100%;padding:13px;background:#061321;border:1px solid #31536a;border
   } finally {
    connect.disabled = false;
    connect.textContent = "Connect";
+  }
+ }
+
+ async function speakAsCandice(text) {
+  if (!privateCode || !text.trim()) return;
+
+  hint.textContent = "Candice is preparing her voice...";
+
+  try {
+   const response = await fetch(WORKER, {
+    method: "POST",
+    headers: {
+     "Content-Type": "application/json",
+     "X-Candice-Access-Code": privateCode
+    },
+    body: JSON.stringify({
+     action: "speak",
+     text: text.trim()
+    })
+   });
+
+   const data = await response.json();
+
+   if (!response.ok || !data.audio) {
+    throw new Error(
+     data.details ||
+     data.error ||
+     "Voice generation failed. HTTP " + response.status
+    );
+   }
+
+   const binary = atob(data.audio);
+   const bytes = new Uint8Array(binary.length);
+
+   for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+   }
+
+   const blob = new Blob(
+    [bytes],
+    {type: data.mimeType || "audio/wav"}
+   );
+
+   const newUrl = URL.createObjectURL(blob);
+
+   if (currentAudio) {
+    currentAudio.pause();
+    currentAudio = null;
+   }
+
+   if (lastAudioUrl) {
+    URL.revokeObjectURL(lastAudioUrl);
+   }
+
+   lastAudioUrl = newUrl;
+   currentAudio = new Audio(lastAudioUrl);
+   replay.disabled = false;
+
+   try {
+    await currentAudio.play();
+    hint.textContent = "Candice is speaking.";
+   } catch (playError) {
+    hint.textContent = "Voice ready. Tap Replay voice to listen.";
+   }
+
+  } catch (e) {
+   console.error("Candice voice error:", e);
+   hint.textContent = "Voice unavailable: " + e.message;
+  }
+ }
+
+ async function replayVoice() {
+  if (!lastAudioUrl) return;
+
+  try {
+   if (currentAudio) {
+    currentAudio.pause();
+    currentAudio.currentTime = 0;
+   } else {
+    currentAudio = new Audio(lastAudioUrl);
+   }
+
+   await currentAudio.play();
+   hint.textContent = "Candice is speaking.";
+  } catch (e) {
+   hint.textContent = "Could not play audio. Please try again.";
   }
  }
 
@@ -392,23 +409,26 @@ input{width:100%;padding:13px;background:#061321;border:1px solid #31536a;border
 
    output.textContent = answer;
 
-   // Candice speaks using her selected voice.
-   speakAsCandice(answer);
+   // Generate and play Candice's Gemini voice.
+   await speakAsCandice(answer);
 
   } catch (e) {
    output.textContent = answer
     ? answer + "\n\n[Connection interrupted: " + e.message + "]"
     : "Connection error: " + e.message;
 
+   hint.textContent = "Please check your connection and try again.";
+
   } finally {
    busy = false;
    send.disabled = !privateCode;
-   mic.disabled = !privateCode ||
-    !(window.SpeechRecognition || window.webkitSpeechRecognition);
 
-   hint.textContent = privateCode
-    ? "Private session active."
-    : "Connect to enable chat.";
+   const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
+   mic.disabled = !privateCode || !Speech;
+
+   if (privateCode && !lastAudioUrl) {
+    hint.textContent = "Private session active.";
+   }
 
    input.focus();
    chat.scrollTop = chat.scrollHeight;
@@ -421,18 +441,27 @@ input{width:100%;padding:13px;background:#061321;border:1px solid #31536a;border
   login.style.display = "grid";
   error.textContent = "";
 
-  if ("speechSynthesis" in window) {
-   speechSynthesis.cancel();
+  if (currentAudio) {
+   currentAudio.pause();
+   currentAudio = null;
   }
+
+  if (lastAudioUrl) {
+   URL.revokeObjectURL(lastAudioUrl);
+   lastAudioUrl = "";
+  }
+
+  replay.disabled = true;
  }
 
  connect.addEventListener("click", connectToCandice);
-
  access.addEventListener("keydown", e => {
   if (e.key === "Enter") connectToCandice();
  });
 
  send.addEventListener("click", sendMessage);
+ replay.addEventListener("click", replayVoice);
+ disconnect.addEventListener("click", disconnectCandice);
 
  input.addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey) {
@@ -440,8 +469,6 @@ input{width:100%;padding:13px;background:#061321;border:1px solid #31536a;border
    sendMessage();
   }
  });
-
- disconnect.addEventListener("click", disconnectCandice);
 
  const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
 
