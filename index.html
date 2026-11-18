@@ -111,6 +111,82 @@ input{width:100%;padding:13px;background:#061321;border:1px solid #31536a;border
 
  let privateCode = "";
  let busy = false;
+ let candiceVoice = null;
+
+ // CANDICE VOICE PERSONALITY
+ const VOICE_SETTINGS = {
+  rate: 0.90,
+  pitch: 1.20,
+  volume: 1.0
+ };
+
+ function chooseCandiceVoice() {
+  if (!("speechSynthesis" in window)) return;
+
+  const voices = speechSynthesis.getVoices();
+  if (!voices.length) return;
+
+  const englishVoices = voices.filter(v =>
+   /^en(-|$)/i.test(v.lang)
+  );
+
+  if (!englishVoices.length) return;
+
+  // Prefer natural-sounding feminine voices.
+  const preferredNames = [
+   "aria",
+   "jenny",
+   "samantha",
+   "sara",
+   "zira",
+   "female",
+   "natural",
+   "neural",
+   "google us english",
+   "google uk english"
+  ];
+
+  const scored = englishVoices.map(voice => {
+   const name = voice.name.toLowerCase();
+   let score = 0;
+
+   preferredNames.forEach((term, index) => {
+    if (name.includes(term)) score += 100 - index * 3;
+   });
+
+   if (/female|woman/i.test(name)) score += 30;
+   if (/child|girl/i.test(name)) score += 40;
+   if (/en-us/i.test(voice.lang)) score += 15;
+   if (voice.localService) score += 2;
+
+   return {voice, score};
+  });
+
+  scored.sort((a,b) => b.score - a.score);
+  candiceVoice = scored[0].voice;
+ }
+
+ if ("speechSynthesis" in window) {
+  chooseCandiceVoice();
+  speechSynthesis.onvoiceschanged = chooseCandiceVoice;
+ }
+
+ function speakAsCandice(text) {
+  if (!("speechSynthesis" in window)) return;
+
+  speechSynthesis.cancel();
+
+  const utterance = new SpeechSynthesisUtterance(text);
+
+  if (!candiceVoice) chooseCandiceVoice();
+  if (candiceVoice) utterance.voice = candiceVoice;
+
+  utterance.rate = VOICE_SETTINGS.rate;
+  utterance.pitch = VOICE_SETTINGS.pitch;
+  utterance.volume = VOICE_SETTINGS.volume;
+
+  speechSynthesis.speak(utterance);
+ }
 
  function addMessage(who, text, type) {
   const box = document.createElement("div");
@@ -243,7 +319,6 @@ input{width:100%;padding:13px;background:#061321;border:1px solid #31536a;border
     throw new Error("The browser could not read the response stream.");
    }
 
-   // Read Google's server-sent events as they arrive.
    const reader = response.body.getReader();
    const decoder = new TextDecoder();
    let buffer = "";
@@ -255,7 +330,6 @@ input{width:100%;padding:13px;background:#061321;border:1px solid #31536a;border
 
     buffer += decoder.decode(value, {stream: true});
 
-    // SSE events are separated by a blank line.
     const events = buffer.split(/\r?\n\r?\n/);
     buffer = events.pop() || "";
 
@@ -266,7 +340,6 @@ input{width:100%;padding:13px;background:#061321;border:1px solid #31536a;border
       if (!line.startsWith("data:")) continue;
 
       const raw = line.slice(5).trim();
-
       if (!raw || raw === "[DONE]") continue;
 
       let event;
@@ -291,7 +364,6 @@ input{width:100%;padding:13px;background:#061321;border:1px solid #31536a;border
     }
    }
 
-   // Process any final event left in the buffer.
    if (buffer.trim()) {
     for (const line of buffer.split(/\r?\n/)) {
      if (!line.startsWith("data:")) continue;
@@ -320,11 +392,8 @@ input{width:100%;padding:13px;background:#061321;border:1px solid #31536a;border
 
    output.textContent = answer;
 
-   // Speak only after the complete streamed answer arrives.
-   if ("speechSynthesis" in window) {
-    speechSynthesis.cancel();
-    speechSynthesis.speak(new SpeechSynthesisUtterance(answer));
-   }
+   // Candice speaks using her selected voice.
+   speakAsCandice(answer);
 
   } catch (e) {
    output.textContent = answer
