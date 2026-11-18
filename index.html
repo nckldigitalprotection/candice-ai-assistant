@@ -115,11 +115,14 @@ input{width:100%;padding:13px;background:#061321;border:1px solid #31536a;border
  function addMessage(who, text, type) {
   const box = document.createElement("div");
   box.className = "msg " + type;
+
   const label = document.createElement("span");
   label.className = "who";
   label.textContent = who;
+
   const content = document.createElement("span");
   content.textContent = text;
+
   box.append(label, content);
   chat.appendChild(box);
   chat.scrollTop = chat.scrollHeight;
@@ -130,8 +133,10 @@ input{width:100%;padding:13px;background:#061321;border:1px solid #31536a;border
   input.disabled = !value;
   send.disabled = !value;
   disconnect.disabled = !value;
+
   const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
   mic.disabled = !value || !Speech;
+
   status.textContent = value ? "CONNECTED" : "OFFLINE";
   dot.style.background = value ? "#42e6a4" : "#d4a94c";
   hint.textContent = value ? "Private session active." : "Connect to enable chat.";
@@ -139,6 +144,7 @@ input{width:100%;padding:13px;background:#061321;border:1px solid #31536a;border
 
  async function connectToCandice() {
   const candidate = access.value.trim();
+
   if (!candidate) {
    error.textContent = "Please enter your access code.";
    return;
@@ -150,9 +156,13 @@ input{width:100%;padding:13px;background:#061321;border:1px solid #31536a;border
 
   try {
    const response = await fetch(WORKER, {method:"GET"});
-   if (!response.ok) throw new Error("Worker health check failed: " + response.status);
+
+   if (!response.ok) {
+    throw new Error("Worker health check failed: " + response.status);
+   }
 
    const data = await response.json();
+
    if (data.status !== "Candice backend online") {
     throw new Error("Unexpected response from Candice backend.");
    }
@@ -161,7 +171,13 @@ input{width:100%;padding:13px;background:#061321;border:1px solid #31536a;border
    access.value = "";
    login.style.display = "none";
    setConnected(true);
-   addMessage("CANDICE", "Backend connection established. I'm ready. What shall we work on?", "ai");
+
+   addMessage(
+    "CANDICE",
+    "Backend connection established. I'm ready. What shall we work on?",
+    "ai"
+   );
+
    input.focus();
 
   } catch (e) {
@@ -174,63 +190,159 @@ input{width:100%;padding:13px;background:#061321;border:1px solid #31536a;border
 
  async function sendMessage() {
   const text = input.value.trim();
+
   if (!text || busy || !privateCode) return;
 
   addMessage("BOSS", text, "user");
   input.value = "";
+
   busy = true;
   send.disabled = true;
+  mic.disabled = true;
+  hint.textContent = "Candice is responding...";
 
   const thinking = addMessage("CANDICE", "Thinking...", "ai");
+  const output = thinking.lastElementChild;
+  let answer = "";
 
   try {
    const response = await fetch(WORKER, {
-    method:"POST",
-    headers:{
-     "Content-Type":"application/json",
-     "X-Candice-Access-Code":privateCode
+    method: "POST",
+    headers: {
+     "Content-Type": "application/json",
+     "X-Candice-Access-Code": privateCode
     },
-    body:JSON.stringify({message:text})
+    body: JSON.stringify({message: text})
    });
 
-   let data;
-   try {
-    data = await response.json();
-   } catch {
-    throw new Error("The server returned an unreadable response. Check the Cloudflare Worker.");
-   }
-
    if (!response.ok) {
+    let data = {};
+
+    try {
+     data = await response.json();
+    } catch {}
+
     if (response.status === 401) {
      privateCode = "";
      login.style.display = "grid";
      setConnected(false);
     }
 
-    // NEW: Show Google's detailed error instead of hiding it.
     const parts = [
      data.error,
      data.googleStatus ? "Google HTTP status: " + data.googleStatus : "",
      data.details
     ].filter(Boolean);
 
-    throw new Error(parts.join(" | ") || "AI request failed. HTTP " + response.status);
+    throw new Error(
+     parts.join(" | ") || "AI request failed. HTTP " + response.status
+    );
    }
 
-   const answer = data.reply || "I couldn't generate a response.";
-   thinking.lastElementChild.textContent = answer;
+   if (!response.body) {
+    throw new Error("The browser could not read the response stream.");
+   }
 
+   // Read Google's server-sent events as they arrive.
+   const reader = response.body.getReader();
+   const decoder = new TextDecoder();
+   let buffer = "";
+
+   while (true) {
+    const {value, done} = await reader.read();
+
+    if (done) break;
+
+    buffer += decoder.decode(value, {stream: true});
+
+    // SSE events are separated by a blank line.
+    const events = buffer.split(/\r?\n\r?\n/);
+    buffer = events.pop() || "";
+
+    for (const eventBlock of events) {
+     const lines = eventBlock.split(/\r?\n/);
+
+     for (const line of lines) {
+      if (!line.startsWith("data:")) continue;
+
+      const raw = line.slice(5).trim();
+
+      if (!raw || raw === "[DONE]") continue;
+
+      let event;
+
+      try {
+       event = JSON.parse(raw);
+      } catch {
+       continue;
+      }
+
+      if (
+       event.event_type === "step.delta" &&
+       event.delta &&
+       event.delta.type === "text" &&
+       typeof event.delta.text === "string"
+      ) {
+       answer += event.delta.text;
+       output.textContent = answer;
+       chat.scrollTop = chat.scrollHeight;
+      }
+     }
+    }
+   }
+
+   // Process any final event left in the buffer.
+   if (buffer.trim()) {
+    for (const line of buffer.split(/\r?\n/)) {
+     if (!line.startsWith("data:")) continue;
+
+     const raw = line.slice(5).trim();
+     if (!raw || raw === "[DONE]") continue;
+
+     try {
+      const event = JSON.parse(raw);
+
+      if (
+       event.event_type === "step.delta" &&
+       event.delta &&
+       event.delta.type === "text" &&
+       typeof event.delta.text === "string"
+      ) {
+       answer += event.delta.text;
+      }
+     } catch {}
+    }
+   }
+
+   if (!answer.trim()) {
+    throw new Error("Candice received no text. Please try again.");
+   }
+
+   output.textContent = answer;
+
+   // Speak only after the complete streamed answer arrives.
    if ("speechSynthesis" in window) {
     speechSynthesis.cancel();
     speechSynthesis.speak(new SpeechSynthesisUtterance(answer));
    }
 
   } catch (e) {
-   thinking.lastElementChild.textContent = "Connection error: " + e.message;
+   output.textContent = answer
+    ? answer + "\n\n[Connection interrupted: " + e.message + "]"
+    : "Connection error: " + e.message;
+
   } finally {
    busy = false;
    send.disabled = !privateCode;
+   mic.disabled = !privateCode ||
+    !(window.SpeechRecognition || window.webkitSpeechRecognition);
+
+   hint.textContent = privateCode
+    ? "Private session active."
+    : "Connect to enable chat.";
+
    input.focus();
+   chat.scrollTop = chat.scrollHeight;
   }
  }
 
@@ -239,35 +351,46 @@ input{width:100%;padding:13px;background:#061321;border:1px solid #31536a;border
   setConnected(false);
   login.style.display = "grid";
   error.textContent = "";
-  if ("speechSynthesis" in window) speechSynthesis.cancel();
+
+  if ("speechSynthesis" in window) {
+   speechSynthesis.cancel();
+  }
  }
 
  connect.addEventListener("click", connectToCandice);
+
  access.addEventListener("keydown", e => {
   if (e.key === "Enter") connectToCandice();
  });
+
  send.addEventListener("click", sendMessage);
+
  input.addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey) {
    e.preventDefault();
    sendMessage();
   }
  });
+
  disconnect.addEventListener("click", disconnectCandice);
 
  const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
+
  if (Speech) {
   mic.addEventListener("click", () => {
    const recognition = new Speech();
    recognition.lang = "en-US";
    recognition.interimResults = false;
+
    recognition.onresult = event => {
     input.value = event.results[0][0].transcript;
     input.focus();
    };
+
    recognition.onerror = () => {
     hint.textContent = "Voice input unavailable. Please type instead.";
    };
+
    recognition.start();
   });
  }
