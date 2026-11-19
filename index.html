@@ -183,6 +183,7 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
  let privateCode = "";
  let busy = false;
  let lastAudioUrls = [];
+ let lastVoiceItems = [];
  let currentAudio = null;
  let currentPlaybackStop = null;
  let audioContext = null;
@@ -287,6 +288,7 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
   }
   lastAudioUrls.forEach(url => URL.revokeObjectURL(url));
   lastAudioUrls = [];
+  lastVoiceItems = [];
   replay.disabled = true;
  }
 
@@ -310,20 +312,86 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
  function queueSpeechChunk(session, text) {
   const clean = text.trim();
   if (!clean || session.cancelled) return;
-  // Keep TTS requests in order and avoid firing many requests at Gemini at once.
-  const task = session.generationChain.then(() => {
+  // Keep voice segments in order. If Gemini TTS is unavailable or rate-limited,
+  // switch this answer to the device's built-in speech engine for the rest of the reply.
+  const task = session.generationChain.then(async () => {
    if (session.cancelled || !privateCode) return null;
+   if (session.browserVoiceOnly) return {browserSpeech:true,text:clean};
    hint.textContent = session.nextIndex === 0 ? "Preparing Candice's first spoken sentence..." : "Preparing the next voice segment...";
-   return generateSpeechBlob(clean);
-  }).catch(error => {
-   console.error("Candice voice segment error:", error);
-   session.voiceError = error;
-   return null;
+   try {
+    return await generateSpeechBlob(clean);
+   } catch (error) {
+    console.warn("Gemini voice unavailable. Switching to device voice:", error);
+    session.voiceError = error;
+    session.browserVoiceOnly = true;
+    session.browserVoiceUsed = true;
+    return {browserSpeech:true,text:clean};
+   }
   });
   session.generationChain = task.then(() => undefined);
   session.tasks.push(task);
   if (!session.playPromise) session.playPromise = consumeSpeechQueue(session);
   wakeSpeechSession(session);
+ }
+
+ function playBrowserSpeech(text, session) {
+  return new Promise(resolve => {
+   if (session.cancelled) { resolve(false); return; }
+   if (!('speechSynthesis' in window) || !('SpeechSynthesisUtterance' in window)) {
+    hint.textContent = "This browser does not support built-in speech. Try Chrome on Android.";
+    resolve(false);
+    return;
+   }
+   try {
+    // Clear any stale utterance before starting the next ordered segment.
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = "en-US";
+    utterance.rate = 1;
+    utterance.pitch = 1.04;
+    let settled = false;
+    const finish = played => {
+     if (settled) return;
+     settled = true;
+     utterance.onstart = null;
+     utterance.onend = null;
+     utterance.onerror = null;
+     if (session.browserUtterance === utterance) session.browserUtterance = null;
+     if (session.stopPlayback === stop) session.stopPlayback = null;
+     if (currentPlaybackStop === stop) currentPlaybackStop = null;
+     resolve(played);
+    };
+    const stop = () => {
+     try { window.speechSynthesis.cancel(); } catch {}
+     finish(false);
+    };
+    session.browserUtterance = utterance;
+    session.stopPlayback = stop;
+    currentPlaybackStop = stop;
+    utterance.onstart = () => {
+     if (!session.cancelled) {
+      setReactorState("speaking");
+      voiceReadout.textContent = "DEVICE VOICE";
+      hint.textContent = "Candice is speaking with your device's built-in voice.";
+     }
+    };
+    utterance.onend = () => finish(!session.cancelled);
+    utterance.onerror = event => {
+     console.warn("Device speech playback issue:", event.error || event);
+     finish(false);
+    };
+    window.speechSynthesis.speak(utterance);
+    // Some mobile browsers do not fire onstart promptly. Keep the UI responsive.
+    if (!session.cancelled) {
+     setReactorState("speaking");
+     voiceReadout.textContent = "DEVICE VOICE";
+     hint.textContent = "Candice is speaking with your device's built-in voice.";
+    }
+   } catch (error) {
+    console.error("Device speech fallback failed:", error);
+    resolve(false);
+   }
+  });
  }
 
  function playAudioUrl(url, session) {
@@ -392,11 +460,23 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
     const task = session.tasks[session.nextIndex++];
     const blob = await task;
     if (session.cancelled) break;
-    if (blob) {
+    if (blob && blob.browserSpeech) {
+     if (speechSession === session) {
+      lastVoiceItems.push({type:"browser",text:blob.text});
+      replay.disabled = false;
+     }
+     const played = await playBrowserSpeech(blob.text, session);
+     if (session.cancelled) break;
+     if (!played) {
+      session.playbackError = true;
+      hint.textContent = "Device voice could not play. Check your phone's text-to-speech settings.";
+     }
+    } else if (blob) {
      const url = URL.createObjectURL(blob);
      session.urls.push(url);
      if (speechSession === session) {
       lastAudioUrls.push(url);
+      lastVoiceItems.push({type:"audio",url});
       replay.disabled = false;
      }
      const played = await playAudioUrl(url, session);
@@ -416,11 +496,12 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
    await new Promise(resolve => { session.wake = resolve; });
   }
   if (speechSession === session && !session.cancelled) {
-   replay.disabled = lastAudioUrls.length === 0;
+   replay.disabled = lastVoiceItems.length === 0;
    setReactorState("idle");
-   if (session.voiceError && !lastAudioUrls.length) hint.textContent = "Voice unavailable: " + session.voiceError.message;
-   else if (session.playbackError && lastAudioUrls.length) hint.textContent = "Tap Replay voice to hear Candice's answer.";
-   else if (!lastAudioUrls.length) hint.textContent = "Candice replied, but no voice audio was produced. Please try again.";
+   if (session.playbackError && !lastVoiceItems.length) hint.textContent = "Voice playback failed. Check your device's text-to-speech settings.";
+   else if (session.browserVoiceUsed && !session.playbackError) hint.textContent = "Gemini voice limit reached. Candice used your device's built-in voice instead.";
+   else if (session.playbackError && lastVoiceItems.length) hint.textContent = "Some voice segments could not play. Tap Replay voice to try again.";
+   else if (!lastVoiceItems.length) hint.textContent = "Candice replied, but no voice audio was produced. Please try again.";
    else hint.textContent = "Private session active.";
   }
  }
@@ -471,20 +552,23 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
  }
 
  async function replayVoice() {
-  if (!lastAudioUrls.length) return;
+  if (!lastVoiceItems.length) return;
   try {
+   if (currentPlaybackStop) currentPlaybackStop();
    if (currentAudio) { currentAudio.pause(); currentAudio = null; }
-   const replaySession = {cancelled:false,stopPlayback:null};
+   const replaySession = {cancelled:false,stopPlayback:null,browserUtterance:null};
    setReactorState("speaking");
    hint.textContent = "Replaying Candice's answer.";
-   for (const url of lastAudioUrls) {
-    const played = await playAudioUrl(url,replaySession);
+   for (const item of lastVoiceItems) {
+    const played = item.type === "browser"
+     ? await playBrowserSpeech(item.text,replaySession)
+     : await playAudioUrl(item.url,replaySession);
     if (!played) break;
    }
    if (privateCode) setReactorState("idle");
   } catch (e) {
    setReactorState("idle");
-   hint.textContent = "Could not play audio. Please try again.";
+   hint.textContent = "Could not replay the voice. Please try again.";
   }
  }
 
@@ -505,7 +589,8 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
    id:++speechSessionCounter, cancelled:false, finished:false, tasks:[], nextIndex:0,
    generationChain:Promise.resolve(), playPromise:null, wake:null, urls:[],
    speechBuffer:"", pendingSpeech:"", pendingSentenceCount:0, firstChunkSent:false,
-   voiceError:null, playbackError:false, stopPlayback:null
+   voiceError:null, playbackError:false, stopPlayback:null,
+   browserVoiceOnly:false, browserVoiceUsed:false, browserUtterance:null
   };
   speechSession = session;
   hint.textContent = "Candice is responding...";
@@ -673,6 +758,7 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
    speechSession = null;
   }
   clearPreviousAudio();
+  if ("speechSynthesis" in window) { try { window.speechSynthesis.cancel(); } catch {} }
   setConnected(false); login.style.display = "grid"; error.textContent = "";
   savedMemories = []; memoryList.replaceChildren(); closeEdit();
  }
@@ -872,6 +958,7 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
  } else {
   mic.title = "Speech recognition is not supported in this browser.";
  }
+ if (!("speechSynthesis" in window)) console.warn("Built-in browser voice is unavailable on this device.");
  updateMicButton();
  setConnected(false);
 })();
