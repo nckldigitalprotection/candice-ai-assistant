@@ -334,21 +334,68 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
   wakeSpeechSession(session);
  }
 
- function playBrowserSpeech(text, session) {
-  return new Promise(resolve => {
-   if (session.cancelled) { resolve(false); return; }
-   if (!('speechSynthesis' in window) || !('SpeechSynthesisUtterance' in window)) {
-    hint.textContent = "This browser does not support built-in speech. Try Chrome on Android.";
-    resolve(false);
-    return;
-   }
-   try {
+ async function chooseCandiceDeviceVoice() {
+  if (!("speechSynthesis" in window)) return null;
+  const synth = window.speechSynthesis;
+  let voices = synth.getVoices();
+  // Android Chrome may populate its voice list shortly after the page loads.
+  if (!voices.length) {
+   await new Promise(resolve => {
+    let done = false;
+    const finish = () => {
+     if (done) return;
+     done = true;
+     synth.removeEventListener("voiceschanged", finish);
+     resolve();
+    };
+    synth.addEventListener("voiceschanged", finish);
+    setTimeout(finish, 1200);
+   });
+   voices = synth.getVoices();
+  }
+  const english = voices.filter(v => /^en(-|_)/i.test(v.lang || ""));
+  if (!english.length) return null;
+  const score = voice => {
+   const details = `${voice.name || ""} ${voice.voiceURI || ""}`.toLowerCase();
+   let points = 0;
+   if (/^en[-_]us/i.test(voice.lang || "")) points += 35;
+   else if (/^en[-_]gb/i.test(voice.lang || "")) points += 22;
+   else points += 12;
+   if (/female|woman|samantha|ava|aria|jenny|zira|susan|karen|moira|tessa|sfg|female_1/i.test(details)) points += 60;
+   if (/google.*(us|english)|english.*(us|united states)/i.test(details)) points += 12;
+   if (voice.default) points += 4;
+   if (voice.localService) points += 3;
+   if (/(^|[\s#_-])male([\s#_-]|$)|david|mark|guy|daniel/i.test(details)) points -= 45;
+   return points;
+  };
+  const ranked = [...english].sort((a,b) => score(b) - score(a));
+  // Only override the phone's selected voice when the browser exposes a clear
+  // female voice. Otherwise preserve the device's own default English voice.
+  const best = ranked[0];
+  const bestDetails = `${best.name || ""} ${best.voiceURI || ""}`.toLowerCase();
+  return /female|woman|samantha|ava|aria|jenny|zira|susan|karen|moira|tessa|sfg|female_1/i.test(bestDetails)
+   ? best
+   : (english.find(v => v.default) || english.find(v => /^en[-_]us/i.test(v.lang || "")) || best);
+ }
+
+ async function playBrowserSpeech(text, session) {
+  if (session.cancelled) return false;
+  if (!("speechSynthesis" in window) || !("SpeechSynthesisUtterance" in window)) {
+   hint.textContent = "This browser does not support built-in speech. Try Chrome on Android.";
+   return false;
+  }
+  try {
+   const selectedVoice = await chooseCandiceDeviceVoice();
+   if (session.cancelled) return false;
+   return await new Promise(resolve => {
     // Clear any stale utterance before starting the next ordered segment.
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = "en-US";
-    utterance.rate = 1;
-    utterance.pitch = 1.04;
+    utterance.lang = selectedVoice?.lang || "en-US";
+    if (selectedVoice) utterance.voice = selectedVoice;
+    // Slightly slower pacing and a gentle pitch lift make the fallback less flat.
+    utterance.rate = 0.94;
+    utterance.pitch = 1.12;
     let settled = false;
     const finish = played => {
      if (settled) return;
@@ -387,11 +434,11 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
      voiceReadout.textContent = "DEVICE VOICE";
      hint.textContent = "Candice is speaking with your device's built-in voice.";
     }
-   } catch (error) {
-    console.error("Device speech fallback failed:", error);
-    resolve(false);
-   }
-  });
+   });
+  } catch (error) {
+   console.error("Device speech fallback failed:", error);
+   return false;
+  }
  }
 
  function playAudioUrl(url, session) {
