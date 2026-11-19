@@ -182,8 +182,11 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
 
  let privateCode = "";
  let busy = false;
- let lastAudioUrl = "";
+ let lastAudioUrls = [];
  let currentAudio = null;
+ let currentPlaybackStop = null;
+ let speechSession = null;
+ let speechSessionCounter = 0;
  let savedMemories = [];
  let editingMemoryId = null;
 
@@ -267,47 +270,182 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
   return data;
  }
 
- async function speakAsCandice(text) {
-  if (!privateCode || !text.trim()) return;
-  hint.textContent = "Candice is preparing her voice...";
-  try {
-   const data = await apiRequest({action:"speak",text:text.trim()});
-   if (!data.audio) throw new Error("Voice generation returned no audio.");
-   const binary = atob(data.audio);
-   const bytes = new Uint8Array(binary.length);
-   for (let i=0;i<binary.length;i++) bytes[i] = binary.charCodeAt(i);
-   const blob = new Blob([bytes],{type:data.mimeType || "audio/wav"});
-   const newUrl = URL.createObjectURL(blob);
-   if (currentAudio) { currentAudio.pause(); currentAudio = null; }
-   if (lastAudioUrl) URL.revokeObjectURL(lastAudioUrl);
-   lastAudioUrl = newUrl;
-   currentAudio = new Audio(lastAudioUrl);
-   replay.disabled = false;
-   currentAudio.onended = () => { if (privateCode) setReactorState("idle"); };
-   try {
-    setReactorState("speaking");
-    await currentAudio.play();
-    hint.textContent = "Candice is speaking.";
-   } catch (playError) {
-    setReactorState("idle");
-    hint.textContent = "Voice ready. Tap Replay voice to listen.";
-   }
-  } catch (e) {
-   setReactorState("idle");
-   console.error("Candice voice error:", e);
-   hint.textContent = "Voice unavailable: " + e.message;
+ function clearPreviousAudio() {
+  if (currentPlaybackStop) currentPlaybackStop();
+  if (currentAudio) {
+   currentAudio.onended = null;
+   currentAudio.onerror = null;
+   currentAudio.pause();
+   currentAudio = null;
+  }
+  lastAudioUrls.forEach(url => URL.revokeObjectURL(url));
+  lastAudioUrls = [];
+  replay.disabled = true;
+ }
+
+ function wakeSpeechSession(session) {
+  if (session && session.wake) {
+   const wake = session.wake;
+   session.wake = null;
+   wake();
   }
  }
 
+ async function generateSpeechBlob(text) {
+  const data = await apiRequest({action:"speak",text:text.trim()});
+  if (!data.audio) throw new Error("Voice generation returned no audio.");
+  const binary = atob(data.audio);
+  const bytes = new Uint8Array(binary.length);
+  for (let i=0;i<binary.length;i++) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes],{type:data.mimeType || "audio/wav"});
+ }
+
+ function queueSpeechChunk(session, text) {
+  const clean = text.trim();
+  if (!clean || session.cancelled) return;
+  // Keep TTS requests in order and avoid firing many requests at Gemini at once.
+  const task = session.generationChain.then(() => {
+   if (session.cancelled || !privateCode) return null;
+   hint.textContent = session.nextIndex === 0 ? "Preparing Candice's first spoken sentence..." : "Preparing the next voice segment...";
+   return generateSpeechBlob(clean);
+  }).catch(error => {
+   console.error("Candice voice segment error:", error);
+   session.voiceError = error;
+   return null;
+  });
+  session.generationChain = task.then(() => undefined);
+  session.tasks.push(task);
+  if (!session.playPromise) session.playPromise = consumeSpeechQueue(session);
+  wakeSpeechSession(session);
+ }
+
+ function playAudioUrl(url, session) {
+  return new Promise(resolve => {
+   if (session.cancelled) { resolve(false); return; }
+   const audio = new Audio(url);
+   currentAudio = audio;
+   let settled = false;
+   const finish = played => {
+    if (settled) return;
+    settled = true;
+    audio.onended = null;
+    audio.onerror = null;
+    if (session.stopPlayback === stop) session.stopPlayback = null;
+    if (currentPlaybackStop === stop) currentPlaybackStop = null;
+    if (currentAudio === audio) currentAudio = null;
+    resolve(played);
+   };
+   const stop = () => {
+    audio.pause();
+    finish(false);
+   };
+   session.stopPlayback = stop;
+   currentPlaybackStop = stop;
+   audio.onended = () => finish(true);
+   audio.onerror = () => finish(false);
+   audio.play().then(() => {
+    if (!session.cancelled) {
+     setReactorState("speaking");
+     hint.textContent = "Candice is speaking.";
+    }
+   }).catch(error => {
+    console.warn("Audio playback was blocked:", error);
+    finish(false);
+   });
+  });
+ }
+
+ async function consumeSpeechQueue(session) {
+  while (!session.cancelled) {
+   if (session.nextIndex < session.tasks.length) {
+    const task = session.tasks[session.nextIndex++];
+    const blob = await task;
+    if (session.cancelled) break;
+    if (blob) {
+     const url = URL.createObjectURL(blob);
+     session.urls.push(url);
+     if (speechSession === session) lastAudioUrls.push(url);
+     setReactorState("speaking");
+     const played = await playAudioUrl(url, session);
+     if (session.cancelled) break;
+     if (!played) {
+      hint.textContent = "Voice is ready. If playback did not start, tap Replay voice.";
+     }
+    }
+    if (!session.cancelled && (!session.finished || session.nextIndex < session.tasks.length)) {
+     setReactorState("thinking");
+     hint.textContent = "Candice is preparing the next part of her answer...";
+    }
+    continue;
+   }
+   if (session.finished) break;
+   await new Promise(resolve => { session.wake = resolve; });
+  }
+  if (speechSession === session && !session.cancelled) {
+   replay.disabled = lastAudioUrls.length === 0;
+   setReactorState("idle");
+   if (session.voiceError && !lastAudioUrls.length) hint.textContent = "Voice unavailable: " + session.voiceError.message;
+   else hint.textContent = "Private session active.";
+  }
+ }
+
+ function addTextToSpeechBuffer(session, delta) {
+  session.speechBuffer += delta;
+  while (true) {
+   // Extract complete sentences as they arrive. The first sentence is sent immediately;
+   // later requests are grouped into roughly two-sentence segments to limit TTS calls.
+   const match = session.speechBuffer.match(/^([\s\S]*?[.!?](?:[\"'”’\)\]]*)\s+)/);
+   if (!match) break;
+   const sentence = match[1].trim();
+   session.speechBuffer = session.speechBuffer.slice(match[0].length);
+   if (sentence) {
+    session.pendingSpeech += (session.pendingSpeech ? " " : "") + sentence;
+    session.pendingSentenceCount++;
+    if (!session.firstChunkSent || session.pendingSentenceCount >= 2 || session.pendingSpeech.length >= 190) {
+     queueSpeechChunk(session,session.pendingSpeech);
+     session.pendingSpeech = "";
+     session.pendingSentenceCount = 0;
+     session.firstChunkSent = true;
+    }
+   }
+  }
+  // Long sentences without punctuation should not delay the first voice segment indefinitely.
+  if (session.speechBuffer.length > 260) {
+   const cut = session.speechBuffer.lastIndexOf(" ",230);
+   if (cut > 100) {
+    session.pendingSpeech += (session.pendingSpeech ? " " : "") + session.speechBuffer.slice(0,cut).trim();
+    session.speechBuffer = session.speechBuffer.slice(cut + 1);
+    queueSpeechChunk(session,session.pendingSpeech);
+    session.pendingSpeech = "";
+    session.pendingSentenceCount = 0;
+    session.firstChunkSent = true;
+   }
+  }
+ }
+
+ function finishSpeechSession(session) {
+  const remaining = [session.pendingSpeech,session.speechBuffer].filter(Boolean).join(" ").trim();
+  if (remaining) queueSpeechChunk(session,remaining);
+  session.pendingSpeech = "";
+  session.speechBuffer = "";
+  session.finished = true;
+  wakeSpeechSession(session);
+  if (!session.playPromise) session.playPromise = consumeSpeechQueue(session);
+  return session.playPromise;
+ }
+
  async function replayVoice() {
-  if (!lastAudioUrl) return;
+  if (!lastAudioUrls.length) return;
   try {
-   if (currentAudio) { currentAudio.pause(); currentAudio.currentTime = 0; }
-   else currentAudio = new Audio(lastAudioUrl);
-   currentAudio.onended = () => { if (privateCode) setReactorState("idle"); };
+   if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+   const replaySession = {cancelled:false,stopPlayback:null};
    setReactorState("speaking");
-   await currentAudio.play();
-   hint.textContent = "Candice is speaking.";
+   hint.textContent = "Replaying Candice's answer.";
+   for (const url of lastAudioUrls) {
+    const played = await playAudioUrl(url,replaySession);
+    if (!played) break;
+   }
+   if (privateCode) setReactorState("idle");
   } catch (e) {
    setReactorState("idle");
    hint.textContent = "Could not play audio. Please try again.";
@@ -322,11 +460,25 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
   busy = true;
   send.disabled = true;
   mic.disabled = true;
+  clearPreviousAudio();
+  const session = {
+   id:++speechSessionCounter, cancelled:false, finished:false, tasks:[], nextIndex:0,
+   generationChain:Promise.resolve(), playPromise:null, wake:null, urls:[],
+   speechBuffer:"", pendingSpeech:"", pendingSentenceCount:0, firstChunkSent:false,
+   voiceError:null, stopPlayback:null
+  };
+  speechSession = session;
   hint.textContent = "Candice is responding...";
   setReactorState("thinking");
   const thinking = addMessage("CANDICE", "Thinking...", "ai");
   const output = thinking.lastElementChild;
   let answer = "";
+  const appendDelta = delta => {
+   answer += delta;
+   output.textContent = answer;
+   chat.scrollTop = chat.scrollHeight;
+   addTextToSpeechBuffer(session,delta);
+  };
   try {
    const response = await fetch(WORKER, {
     method:"POST",
@@ -358,9 +510,7 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
       let event;
       try { event = JSON.parse(raw); } catch { continue; }
       if (event.event_type === "step.delta" && event.delta && event.delta.type === "text" && typeof event.delta.text === "string") {
-       answer += event.delta.text;
-       output.textContent = answer;
-       chat.scrollTop = chat.scrollHeight;
+       appendDelta(event.delta.text);
       }
      }
     }
@@ -372,29 +522,37 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
      if (!raw || raw === "[DONE]") continue;
      try {
       const event = JSON.parse(raw);
-      if (event.event_type === "step.delta" && event.delta && event.delta.type === "text" && typeof event.delta.text === "string") answer += event.delta.text;
+      if (event.event_type === "step.delta" && event.delta && event.delta.type === "text" && typeof event.delta.text === "string") appendDelta(event.delta.text);
      } catch {}
     }
    }
    if (!answer.trim()) throw new Error("Candice received no text. Please try again.");
    output.textContent = answer;
-   await speakAsCandice(answer);
+   await finishSpeechSession(session);
    if (memoryPanel.style.display !== "none") await loadMemories();
   } catch (e) {
-   output.textContent = answer ? answer + "\n\n[Connection interrupted: " + e.message + "]" : "Connection error: " + e.message;
-   hint.textContent = "Please check your connection and try again.";
-   setReactorState(privateCode ? "idle" : "offline");
-  } finally {
-   busy = false;
-   send.disabled = !privateCode;
-   const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
-   mic.disabled = !privateCode || !Speech;
-   if (privateCode && (!currentAudio || currentAudio.paused || currentAudio.ended)) {
-    if (document.body.classList.contains("state-thinking")) setReactorState("idle");
-    if (!lastAudioUrl) hint.textContent = "Private session active.";
+   if (session && !session.cancelled) {
+    output.textContent = answer ? answer + "\n\n[Connection interrupted: " + e.message + "]" : "Connection error: " + e.message;
+    session.cancelled = true;
+    if (session.stopPlayback) session.stopPlayback();
+    wakeSpeechSession(session);
+    hint.textContent = "Please check your connection and try again.";
+    setReactorState(privateCode ? "idle" : "offline");
    }
-   input.focus();
-   chat.scrollTop = chat.scrollHeight;
+  } finally {
+   if (speechSession === session) {
+    if (!session.finished) {
+     session.finished = true;
+     wakeSpeechSession(session);
+    }
+    busy = false;
+    send.disabled = !privateCode;
+    const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
+    mic.disabled = !privateCode || !Speech;
+    if (privateCode && (!currentAudio || currentAudio.paused || currentAudio.ended) && document.body.classList.contains("state-thinking")) setReactorState("idle");
+    input.focus();
+    chat.scrollTop = chat.scrollHeight;
+   }
   }
  }
 
@@ -461,10 +619,16 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
   if (opening) { loadMemories(); memoryPanel.scrollIntoView({behavior:"smooth",block:"start"}); }
  }
  function disconnectCandice() {
-  privateCode = ""; setConnected(false); login.style.display = "grid"; error.textContent = "";
-  if (currentAudio) { currentAudio.pause(); currentAudio = null; }
-  if (lastAudioUrl) { URL.revokeObjectURL(lastAudioUrl); lastAudioUrl = ""; }
-  replay.disabled = true; savedMemories = []; memoryList.replaceChildren(); closeEdit();
+  privateCode = "";
+  if (speechSession) {
+   speechSession.cancelled = true;
+   if (speechSession.stopPlayback) speechSession.stopPlayback();
+   wakeSpeechSession(speechSession);
+   speechSession = null;
+  }
+  clearPreviousAudio();
+  setConnected(false); login.style.display = "grid"; error.textContent = "";
+  savedMemories = []; memoryList.replaceChildren(); closeEdit();
  }
 
  connect.addEventListener("click",connectToCandice);
