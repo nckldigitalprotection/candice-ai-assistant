@@ -187,6 +187,12 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
  let currentPlaybackStop = null;
  let speechSession = null;
  let speechSessionCounter = 0;
+ // Hands-free voice session state. A 3-second pause submits the captured utterance.
+ let listeningMode = false;
+ let recognition = null;
+ let pauseTimer = null;
+ let voiceTranscript = "";
+ let voiceSubmitInProgress = false;
  let savedMemories = [];
  let editingMemoryId = null;
 
@@ -364,17 +370,20 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
     if (blob) {
      const url = URL.createObjectURL(blob);
      session.urls.push(url);
-     if (speechSession === session) lastAudioUrls.push(url);
-     setReactorState("speaking");
+     if (speechSession === session) {
+      lastAudioUrls.push(url);
+      replay.disabled = false;
+     }
      const played = await playAudioUrl(url, session);
      if (session.cancelled) break;
      if (!played) {
-      hint.textContent = "Voice is ready. If playback did not start, tap Replay voice.";
+      session.playbackError = true;
+      hint.textContent = "Audio was generated, but playback was blocked. Tap Replay voice.";
      }
     }
     if (!session.cancelled && (!session.finished || session.nextIndex < session.tasks.length)) {
      setReactorState("thinking");
-     hint.textContent = "Candice is preparing the next part of her answer...";
+     if (!session.playbackError) hint.textContent = "Candice is preparing the next part of her answer...";
     }
     continue;
    }
@@ -385,6 +394,8 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
    replay.disabled = lastAudioUrls.length === 0;
    setReactorState("idle");
    if (session.voiceError && !lastAudioUrls.length) hint.textContent = "Voice unavailable: " + session.voiceError.message;
+   else if (session.playbackError && lastAudioUrls.length) hint.textContent = "Tap Replay voice to hear Candice's answer.";
+   else if (!lastAudioUrls.length) hint.textContent = "Candice replied, but no voice audio was produced. Please try again.";
    else hint.textContent = "Private session active.";
   }
  }
@@ -392,10 +403,10 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
  function addTextToSpeechBuffer(session, delta) {
   session.speechBuffer += delta;
   while (true) {
-   // Extract complete sentences as they arrive. The first sentence is sent immediately;
-   // later requests are grouped into roughly two-sentence segments to limit TTS calls.
-   const match = session.speechBuffer.match(/^([\s\S]*?[.!?](?:[\"'”’\)\]]*)\s+)/);
-   if (!match) break;
+   // Flush at sentence punctuation even when punctuation is the final character
+   // in a streamed delta. This starts the first TTS request before chat finishes.
+   const match = session.speechBuffer.match(/^([\s\S]*?[.!?](?:[\"'”’\)\]]*)?)(?:\s+|$)/);
+   if (!match || !match[1].trim()) break;
    const sentence = match[1].trim();
    session.speechBuffer = session.speechBuffer.slice(match[0].length);
    if (sentence) {
@@ -455,6 +466,10 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
  async function sendMessage() {
   const text = input.value.trim();
   if (!text || busy || !privateCode) return;
+  const fromVoice = voiceSubmitInProgress;
+  voiceSubmitInProgress = false;
+  // A manual Send click ends hands-free mode. Voice-triggered sends keep it active.
+  if (listeningMode && !fromVoice) stopContinuousListening(false);
   addMessage("BOSS", text, "user");
   input.value = "";
   busy = true;
@@ -465,7 +480,7 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
    id:++speechSessionCounter, cancelled:false, finished:false, tasks:[], nextIndex:0,
    generationChain:Promise.resolve(), playPromise:null, wake:null, urls:[],
    speechBuffer:"", pendingSpeech:"", pendingSentenceCount:0, firstChunkSent:false,
-   voiceError:null, stopPlayback:null
+   voiceError:null, playbackError:false, stopPlayback:null
   };
   speechSession = session;
   hint.textContent = "Candice is responding...";
@@ -549,7 +564,12 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
     send.disabled = !privateCode;
     const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
     mic.disabled = !privateCode || !Speech;
-    if (privateCode && (!currentAudio || currentAudio.paused || currentAudio.ended) && document.body.classList.contains("state-thinking")) setReactorState("idle");
+    if (privateCode && listeningMode && Speech) {
+     hint.textContent = "Candice is ready. I'm listening for your next message...";
+     window.setTimeout(startContinuousRecognition, 450);
+    } else if (privateCode && (!currentAudio || currentAudio.paused || currentAudio.ended) && document.body.classList.contains("state-thinking")) {
+     setReactorState("idle");
+    }
     input.focus();
     chat.scrollTop = chat.scrollHeight;
    }
@@ -619,6 +639,7 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
   if (opening) { loadMemories(); memoryPanel.scrollIntoView({behavior:"smooth",block:"start"}); }
  }
  function disconnectCandice() {
+  stopContinuousListening(false);
   privateCode = "";
   if (speechSession) {
    speechSession.cancelled = true;
@@ -645,18 +666,179 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
  input.addEventListener("keydown",e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } });
 
  const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+ function updateMicButton() {
+  if (listeningMode) {
+   mic.textContent = "■";
+   mic.title = "Stop continuous listening";
+   mic.setAttribute("aria-label","Stop continuous listening");
+  } else {
+   mic.textContent = "🎙";
+   mic.title = "Start continuous listening";
+   mic.setAttribute("aria-label","Start continuous listening");
+  }
+ }
+
+ function clearVoicePauseTimer() {
+  if (pauseTimer) window.clearTimeout(pauseTimer);
+  pauseTimer = null;
+ }
+
+ function currentVoiceText(localFinal, localInterim) {
+  return [voiceTranscript,localFinal,localInterim].filter(Boolean).join(" ").replace(/\s+/g," ").trim();
+ }
+
+ function stopContinuousListening(showMessage = true) {
+  listeningMode = false;
+  clearVoicePauseTimer();
+  voiceTranscript = "";
+  voiceSubmitInProgress = false;
+  const active = recognition;
+  recognition = null;
+  if (active) {
+   try { active.stop(); } catch {}
+  }
+  updateMicButton();
+  if (privateCode && !busy) {
+   mic.disabled = false;
+   setReactorState("idle");
+   if (showMessage) hint.textContent = "Continuous listening stopped.";
+  }
+ }
+
+ function handleVoiceText(text) {
+  clearVoicePauseTimer();
+  const clean = text.replace(/\s+/g," ").trim();
+  voiceTranscript = "";
+  if (!clean) {
+   if (listeningMode && privateCode && !busy) window.setTimeout(startContinuousRecognition,350);
+   return;
+  }
+  // Spoken stop command is recognized without sending it to the AI.
+  const stopMatch = clean.match(/\b(?:Candice[,]?\s+)?stop listening\b[.!]?\s*$/i);
+  if (stopMatch) {
+   const remainder = clean.slice(0,stopMatch.index).trim();
+   stopContinuousListening(true);
+   if (remainder) {
+    input.value = remainder;
+    sendMessage();
+   }
+   return;
+  }
+  if (!listeningMode || !privateCode || busy) return;
+  input.value = clean;
+  voiceSubmitInProgress = true;
+  sendMessage();
+ }
+
+ function startContinuousRecognition() {
+  if (!Speech || !privateCode || !listeningMode || busy || recognition) return;
+  let localFinal = "";
+  let localInterim = "";
+  const rec = new Speech();
+  recognition = rec;
+  rec.lang = "en-US";
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.maxAlternatives = 1;
+
+  rec.onstart = () => {
+   if (recognition !== rec || !listeningMode) return;
+   mic.disabled = false;
+   setReactorState("listening");
+   hint.textContent = "Candice is listening. She'll send after a 3-second pause.";
+  };
+
+  rec.onresult = event => {
+   if (recognition !== rec || !listeningMode) return;
+   localFinal = "";
+   localInterim = "";
+   for (let i=0;i<event.results.length;i++) {
+    const result = event.results[i];
+    const words = result[0] && result[0].transcript ? result[0].transcript.trim() : "";
+    if (!words) continue;
+    if (result.isFinal) localFinal += (localFinal ? " " : "") + words;
+    else localInterim += (localInterim ? " " : "") + words;
+   }
+   const heard = currentVoiceText(localFinal,localInterim);
+   if (!heard) return;
+   input.value = heard;
+   clearVoicePauseTimer();
+   pauseTimer = window.setTimeout(() => {
+    if (!listeningMode || busy) return;
+    const finalText = currentVoiceText(localFinal,localInterim);
+    if (!finalText) return;
+    const active = recognition;
+    if (active) {
+     // Let onend submit after the recognition service closes cleanly.
+     active.__candicePauseSubmit = true;
+     try { active.stop(); } catch { handleVoiceText(finalText); }
+    } else {
+     handleVoiceText(finalText);
+    }
+   },3000);
+  };
+
+  rec.onerror = event => {
+   if (recognition !== rec) return;
+   const code = event.error || "unknown";
+   if (code === "not-allowed" || code === "service-not-allowed") {
+    stopContinuousListening(false);
+    hint.textContent = "Microphone permission was denied. Allow microphone access in Chrome and try again.";
+   } else if (code !== "no-speech" && code !== "aborted") {
+    hint.textContent = "Voice recognition issue: " + code + ". Reconnecting...";
+   }
+  };
+
+  rec.onend = () => {
+   if (recognition === rec) recognition = null;
+   const shouldSubmit = !!rec.__candicePauseSubmit;
+   if (shouldSubmit) {
+    const finalText = currentVoiceText(localFinal,localInterim);
+    handleVoiceText(finalText);
+    return;
+   }
+   // Chrome may end a continuous recognition session on its own. Preserve the
+   // captured words and reopen recognition while the 3-second pause timer runs.
+   if (listeningMode && privateCode && !busy) {
+    const captured = [localFinal,localInterim].filter(Boolean).join(" ").trim();
+    if (captured) voiceTranscript = [voiceTranscript,captured].filter(Boolean).join(" ").trim();
+    // The current words are now committed to voiceTranscript. Clear this
+    // recognizer's local copy so the pending pause timer cannot count them twice.
+    localFinal = "";
+    localInterim = "";
+    window.setTimeout(startContinuousRecognition,300);
+   }
+  };
+
+  try {
+   rec.start();
+  } catch (e) {
+   if (recognition === rec) recognition = null;
+   if (listeningMode && privateCode) {
+    hint.textContent = "Could not restart the microphone. Tap the microphone button to try again.";
+    stopContinuousListening(false);
+   }
+  }
+ }
+
  if (Speech) {
   mic.addEventListener("click",() => {
-   const recognition = new Speech();
-   recognition.lang = "en-US";
-   recognition.interimResults = false;
-   recognition.onstart = () => { setReactorState("listening"); hint.textContent = "Candice is listening..."; };
-   recognition.onresult = event => { input.value = event.results[0][0].transcript; input.focus(); };
-   recognition.onerror = () => { setReactorState("idle"); hint.textContent = "Voice input unavailable. Please type instead."; };
-   recognition.onend = () => { if (privateCode && !busy) setReactorState("idle"); };
-   recognition.start();
+   if (listeningMode) {
+    stopContinuousListening(true);
+    return;
+   }
+   if (!privateCode || busy) return;
+   listeningMode = true;
+   voiceTranscript = "";
+   voiceSubmitInProgress = false;
+   updateMicButton();
+   startContinuousRecognition();
   });
+ } else {
+  mic.title = "Speech recognition is not supported in this browser.";
  }
+ updateMicButton();
  setConnected(false);
 })();
 </script>
