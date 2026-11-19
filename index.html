@@ -185,6 +185,7 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
  let lastAudioUrls = [];
  let currentAudio = null;
  let currentPlaybackStop = null;
+ let audioContext = null;
  let speechSession = null;
  let speechSessionCounter = 0;
  // Hands-free voice session state. A 3-second pause submits the captured utterance.
@@ -328,39 +329,63 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
  function playAudioUrl(url, session) {
   return new Promise(resolve => {
    if (session.cancelled) { resolve(false); return; }
-   const audio = new Audio(url);
-   currentAudio = audio;
+   let source = null;
    let settled = false;
+   const playback = {
+    paused: true, ended: false, onended: null, onerror: null, wasStopped: false,
+    pause() {
+     this.wasStopped = true;
+     if (source) { try { source.stop(); } catch {} }
+     finish(false);
+    }
+   };
+   currentAudio = playback;
    const finish = played => {
     if (settled) return;
     settled = true;
-    audio.onended = null;
-    audio.onerror = null;
+    playback.paused = true;
+    playback.ended = true;
+    if (source) {
+     source.onended = null;
+     try { source.disconnect(); } catch {}
+    }
     if (session.stopPlayback === stop) session.stopPlayback = null;
     if (currentPlaybackStop === stop) currentPlaybackStop = null;
-    if (currentAudio === audio) currentAudio = null;
+    if (currentAudio === playback) currentAudio = null;
     resolve(played);
    };
-   const stop = () => {
-    audio.pause();
-    finish(false);
-   };
+   const stop = () => playback.pause();
    session.stopPlayback = stop;
    currentPlaybackStop = stop;
-   audio.onended = () => finish(true);
-   audio.onerror = () => finish(false);
-   audio.play().then(() => {
-    if (!session.cancelled) {
-     setReactorState("speaking");
-     hint.textContent = "Candice is speaking.";
+   (async () => {
+    try {
+     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+     if (!AudioContextClass) throw new Error('Web Audio is not supported in this browser.');
+     if (!audioContext) audioContext = new AudioContextClass();
+     if (audioContext.state !== 'running') await audioContext.resume();
+     const response = await fetch(url);
+     if (!response.ok) throw new Error('Could not load generated voice audio.');
+     const audioBytes = await response.arrayBuffer();
+     const audioBuffer = await audioContext.decodeAudioData(audioBytes);
+     if (settled || session.cancelled) { finish(false); return; }
+     source = audioContext.createBufferSource();
+     source.buffer = audioBuffer;
+     source.connect(audioContext.destination);
+     source.onended = () => finish(!playback.wasStopped);
+     playback.paused = false;
+     playback.ended = false;
+     source.start(0);
+     if (!session.cancelled) {
+      setReactorState('speaking');
+      hint.textContent = 'Candice is speaking.';
+     }
+    } catch (e) {
+     console.warn('Candice audio playback failed:', e);
+     finish(false);
     }
-   }).catch(error => {
-    console.warn("Audio playback was blocked:", error);
-    finish(false);
-   });
+   })();
   });
  }
-
  async function consumeSpeechQueue(session) {
   while (!session.cancelled) {
    if (session.nextIndex < session.tasks.length) {
@@ -829,6 +854,15 @@ input,select{width:100%;padding:12px;background:#04111e;border:1px solid rgba(79
     return;
    }
    if (!privateCode || busy) return;
+   // Unlock browser audio during the user's microphone tap. Later automatic
+   // replies can then play through Web Audio without a fresh tap.
+   try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (AudioContextClass) {
+     if (!audioContext) audioContext = new AudioContextClass();
+     if (audioContext.state !== "running") audioContext.resume().catch(e => console.warn("Audio unlock failed:", e));
+    }
+   } catch (e) { console.warn("Audio unlock failed:", e); }
    listeningMode = true;
    voiceTranscript = "";
    voiceSubmitInProgress = false;
